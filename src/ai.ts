@@ -9,52 +9,108 @@ interface ParsedTask {
 }
 
 export class AI {
-  private client: GoogleGenAI | null = null;
+  private geminiClient: GoogleGenAI | null = null;
 
   constructor() {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (apiKey) {
-      this.client = new GoogleGenAI({ apiKey });
+    if (process.env.GEMINI_API_KEY) {
+      this.geminiClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
     }
   }
 
   async parseTask(prompt: string): Promise<ParsedTask[]> {
-    if (this.client) {
-      try {
-        const systemPrompt = `You are a task parser. Parse the user's natural language into structured tasks.
+    const json = await this.tryLlmProviders(prompt);
+    if (json) return json;
+    return this.basicParse(prompt);
+  }
+
+  private async tryLlmProviders(prompt: string): Promise<ParsedTask[] | null> {
+    const preferred = (process.env.LLM_PROVIDER || 'zen');
+
+    if (preferred === 'gemini') {
+      const r = await this.callGemini(prompt);
+      if (r) return r;
+    }
+
+    const zen = await this.callZen(prompt);
+    if (zen) return zen;
+
+    if (preferred !== 'custom') {
+      const gemini = await this.callGemini(prompt);
+      if (gemini) return gemini;
+    }
+
+    return null;
+  }
+
+  private async callZen(prompt: string): Promise<ParsedTask[] | null> {
+    try {
+      const apiKey = process.env.ZEN_API_KEY || 'sk-u8mPctB6o43VPBTszjsy14D38yQGCWahMpYlNXSviU8s1mbjfY7dmUnvlhv6Pz3j';
+      const model = process.env.ZEN_MODEL || 'big-pickle';
+      const baseUrl = process.env.ZEN_API_URL || 'https://opencode.ai/zen/v1/chat/completions';
+      const systemPrompt = `You are a task parser. Parse the user's natural language into structured tasks.
 Return ONLY valid JSON array. Each task object has: title (string, required), description (string), priority ("low"|"medium"|"high"), labels (string array), dueDate (ISO date string or null).
 Examples:
-"add task review PR by Friday high priority" → [{"title":"Review PR","priority":"high","labels":[],"dueDate":"2026-05-10"}]
-"remind me to buy groceries tomorrow with label personal" → [{"title":"Buy groceries","priority":"medium","labels":["personal"],"dueDate":"2026-05-09"}]
-"fix login bug on saturday and deploy to production" → [{"title":"Fix login bug","priority":"high","labels":[],"dueDate":"2026-05-11"},{"title":"Deploy to production","priority":"high","labels":["deploy"],"dueDate":"2026-05-11"}]`;
+"add task review PR by Friday high priority" -> [{"title":"Review PR","priority":"high","labels":[],"dueDate":"2026-05-10"}]
+"remind me to buy groceries tomorrow with label personal" -> [{"title":"Buy groceries","priority":"medium","labels":["personal"],"dueDate":"2026-05-09"}]
+"fix login bug on saturday and deploy to production" -> [{"title":"Fix login bug","priority":"high","labels":[],"dueDate":"2026-05-11"},{"title":"Deploy to production","priority":"high","labels":["deploy"],"dueDate":"2026-05-11"}]`;
 
-        const response = await this.client.models.generateContent({
-          model: 'gemini-2.0-flash',
-          contents: prompt,
-          config: {
-            systemInstruction: { role: 'user', parts: [{ text: systemPrompt }] },
-            temperature: 0.1,
-          }
-        });
+      const res = await fetch(baseUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+        body: JSON.stringify({ model, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }], max_tokens: 500, temperature: 0.1 }),
+      });
 
-        const text = response.text;
-        if (text) {
-          const jsonMatch = text.match(/\[[\s\S]*\]/);
-          if (jsonMatch) {
-            const parsed = JSON.parse(jsonMatch[0]);
-            return parsed.map((t: any) => ({
-              ...t,
-              dueDate: t.dueDate ? new Date(t.dueDate) : null,
-              priority: t.priority || 'medium',
-              labels: t.labels || [],
-            }));
-          }
+      if (!res.ok) return null;
+      const data = await res.json() as any;
+      const content = data.choices?.[0]?.message?.content;
+      if (!content) return null;
+
+      const jsonMatch = content.match(/\[[\s\S]*\]/);
+      if (!jsonMatch) return null;
+
+      const parsed = JSON.parse(jsonMatch[0]);
+      return parsed.map((t: any) => ({
+        ...t,
+        dueDate: t.dueDate ? new Date(t.dueDate) : null,
+        priority: t.priority || 'medium',
+        labels: t.labels || [],
+      }));
+    } catch { return null; }
+  }
+
+  private async callGemini(prompt: string): Promise<ParsedTask[] | null> {
+    if (!this.geminiClient) return null;
+    try {
+      const systemPrompt = `You are a task parser. Parse the user's natural language into structured tasks.
+Return ONLY valid JSON array. Each task object has: title (string, required), description (string), priority ("low"|"medium"|"high"), labels (string array), dueDate (ISO date string or null).
+Examples:
+"add task review PR by Friday high priority" -> [{"title":"Review PR","priority":"high","labels":[],"dueDate":"2026-05-10"}]
+"remind me to buy groceries tomorrow with label personal" -> [{"title":"Buy groceries","priority":"medium","labels":["personal"],"dueDate":"2026-05-09"}]
+"fix login bug on saturday and deploy to production" -> [{"title":"Fix login bug","priority":"high","labels":[],"dueDate":"2026-05-11"},{"title":"Deploy to production","priority":"high","labels":["deploy"],"dueDate":"2026-05-11"}]`;
+
+      const response = await this.geminiClient.models.generateContent({
+        model: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
+        contents: prompt,
+        config: {
+          systemInstruction: { role: 'user', parts: [{ text: systemPrompt }] },
+          temperature: 0.1,
         }
-      } catch (error) {
-        // Fallback to basic parsing
-      }
-    }
-    return this.basicParse(prompt);
+      });
+
+      const text = response.text;
+      if (!text) return null;
+
+      const jsonMatch = text.match(/\[[\s\S]*\]/);
+      if (!jsonMatch) return null;
+
+      const parsed = JSON.parse(jsonMatch[0]);
+      return parsed.map((t: any) => ({
+        ...t,
+        dueDate: t.dueDate ? new Date(t.dueDate) : null,
+        priority: t.priority || 'medium',
+        labels: t.labels || [],
+      }));
+    } catch { return null; }
   }
 
   private basicParse(prompt: string): ParsedTask[] {
